@@ -1,4 +1,8 @@
 from contextlib import asynccontextmanager
+
+import bcrypt
+import uuid
+
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from db import SessionLocal, engine
@@ -19,30 +23,45 @@ from email_utils import send_email
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import EmailStr
 from datetime import datetime, timezone
-import secrets
 import random
-
-Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print('Starting lifespan')
+    Base.metadata.create_all(bind=engine)
+
+    session = SessionLocal()
+    now = datetime.now(timezone.utc)
+
+    default_attorneys = [
+        {
+            "name": "Alex Morgan",
+            "email": "hello@example.com",
+            "password": "pw1",
+        }    
+    ]
+
+    for a in default_attorneys:
+        exists = session.query(Attorney).filter_by(email=a["email"]).first()
+        if not exists:
+            hashed_pw = bcrypt.hashpw(a["password"].encode(), bcrypt.gensalt()).decode()
+            session.add(Attorney(
+                id=str(uuid.uuid4()),
+                name=a["name"],
+                email=a["email"],
+                salted_hashed_password=hashed_pw,
+                created_at=now,
+                updated_at=now
+            ))
+
+    session.commit()
+    session.close()
+
     yield
 
 app = FastAPI(lifespan=lifespan)
 
 security = HTTPBasic()
-ADMIN_USER = "admin"
-ADMIN_PASS = "bigchungus"
-
-def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, ADMIN_USER)
-    correct_password = secrets.compare_digest(credentials.password, ADMIN_PASS)
-    if not (correct_username and correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid admin credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
 
 def get_db():
     db = SessionLocal()
@@ -50,6 +69,19 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def verify_attorney(
+        credentials: HTTPBasicCredentials = Depends(security),
+        db: Session = Depends(get_db)
+):
+    attorney = db.query(Attorney).filter_by(email=credentials.username).first()
+    if not attorney or not bcrypt.checkpw(credentials.password.encode(), attorney.salted_hashed_password.encode()):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return attorney
 
 @app.get("/")
 def root():
@@ -147,24 +179,20 @@ def submit_prospect(data: ProspectSubmit, db: Session = Depends(get_db)):
     subject = "New Prospect Submission"
     body = f"""
 Hey {prospect.first_name} {prospect.last_name},
-
 Thanks for submitting your info to Alma. One of our attorneys will be in touch soon.
-
 In the meantime, your assigned attorney is {attorney.name} ({attorney.email}).
-
-Best,  
-The Alma Team
 """.strip()
 
     try:
         send_email(subject, body, [prospect.email, attorney.email])
     except Exception:
+        print("Logging that email error occurred")
         pass
 
     return {"message": "Prospect submitted."}
 
 @app.post("/admin/prospect/mark")
-def mark_prospect(data: AdminProspectMark, db: Session = Depends(get_db), _: str = Depends(verify_admin)):
+def mark_prospect(data: AdminProspectMark, db: Session = Depends(get_db), attorney=Depends(verify_attorney)):
     prospect = db.query(Prospect).filter_by(email=data.email.lower()).first()
     if not prospect or prospect.state != "PENDING":
         raise HTTPException(status_code=400, detail="Only PENDING prospects can be marked")
@@ -177,7 +205,7 @@ def mark_prospect(data: AdminProspectMark, db: Session = Depends(get_db), _: str
 @app.get("/admin/prospect/")
 def list_prospects(
         db: Session = Depends(get_db),
-        _: str = Depends(verify_admin),
+        attorney = Depends(verify_attorney),
         limit: int = Query(5, ge=1, le=100),
         offset: int = Query(0, ge=0)
 ):
